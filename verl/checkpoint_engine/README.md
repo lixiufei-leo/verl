@@ -20,6 +20,15 @@ Checkpoint Engine is an unified abstract layer to synchronize weights between va
 |nixl|NIXL|all_gather+ring p2p|Various transport backends (D2D, H2H, H2D, etc)<br>- UCX<br>- UCCL<br>- Mooncacke|Medium/High|High: dynamic adjust ring topology|Off-policy training<br>- Actor/rollout disaggregated<br>- Elastic rollout<br>- Rollout fault tolerance<br>- Heterogeneous hardware rollout
 |kimi_ckpt_engine|MOONCAKE+NCCL/HCCL|p2p+broadcast|NVIDIA/Ascend|High|Low: rebuild communication group|Off-policy training<br>- Actor/rollout disaggregated<br>- Save checkpoint each time
 |mooncake|Mooncake Transfer Engine|all_gather+ring p2p|NVIDIA/Ascend|High|High: dynamic adjust ring topology|Off-policy training<br>- Actor/rollout disaggregated<br>- Fixed clusters
+|mori|MoRI-IO|all_gather (or per-rank shards)+p2p striped over all NICs, XGMI fan-out inside each rollout node|AMD GPU & RDMA NIC (Pollara AINIC tested)|High|High: topology rebuilt each sync|Off-policy training<br>- Actor/rollout disaggregated<br>- AMD clusters
+
+##### mori detail:
+
+`mori` pushes buckets with one-sided RDMA WRITE through [MoRI-IO](https://github.com/ROCm/mori) (`pip install amd-mori`). The model is split into stripes, one per trainer rank (up to `num_chains`, default 8), each sent by its own trainer GPU through its own NIC. On every rollout node one GPU holds each stripe (a different GPU per stripe, so all NICs of the node are used): it receives the stripe from outside and copies it to the other GPUs of the node over XGMI; the holders of a stripe on different rollout nodes form a chain. Each rollout node therefore takes one copy of the model, spread over its NICs.
+
+With `export: shard`, stripe r carries trainer rank r's own shards from the training engine's `get_per_tensor_param_shard()` (bf16): the trainer does not all-gather, and rollout workers put full tensors together from the pieces of all stripes (and split packed MoE experts into per-expert names, as the full export does). This needs `num_chains` >= the trainer world size and shards that are one flat range of the full tensor (FSDP2 `Shard(0)`); the trainer worker hands its training engine to `send_weights` (`consumes_training_engine`).
+
+Each worker registers one region of `num_slots * update_weights_bucket_megabytes` (default 2 slots) once and keeps it, the QPs and the sockets across syncs; each stripe gets `update_weights_bucket_megabytes / num_chains` per slot, so larger buckets mean fewer, larger transfers. Options go in `engine_kwargs.mori` (`num_chains`, `num_slots`, `export`, `intra_node`, `qp_per_transfer`, `num_nics_per_transfer`, `timeout_s`); `MORI_CKPT_STATS=1` logs a per-sync time breakdown and `MORI_CKPT_VERIFY=send|recv|all` adds per-bucket checksums for debugging. Buckets are allocated with cupy because MoRI cannot register PyTorch expandable-segment (VMM) memory.
 
 ##### kimi_ckpt_engine detail:
 
